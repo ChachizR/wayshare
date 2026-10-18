@@ -98,6 +98,9 @@ pub struct SeqConfig {
     /// RC modes other than CQP adjust QP per CU.
     pub cu_qp_delta: bool,
     pub sao: bool,
+    pub dependent_slices: bool,
+    pub transform_depth_inter: u32,
+    pub transform_depth_intra: u32,
 }
 
 impl SeqConfig {
@@ -216,8 +219,8 @@ impl SeqConfig {
         w.ue(3); // log2_diff_max_min: 64
         w.ue(0); // log2_min_transform_block_size_minus2: 4
         w.ue(3); // log2_diff_max_min_transform: 32
-        w.ue(4); // max_transform_hierarchy_depth_inter
-        w.ue(4); // max_transform_hierarchy_depth_intra
+        w.ue(self.transform_depth_inter); // max_transform_hierarchy_depth_inter
+        w.ue(self.transform_depth_intra); // max_transform_hierarchy_depth_intra
         w.flag(false); // scaling_list_enabled
         w.flag(true); // amp_enabled
         w.flag(self.sao); // sample_adaptive_offset_enabled
@@ -258,7 +261,7 @@ impl SeqConfig {
         let mut w = BitWriter::default();
         w.ue(0); // pps_pic_parameter_set_id
         w.ue(0); // pps_seq_parameter_set_id
-        w.flag(true); // dependent_slice_segments_enabled (what radeonsi advertises)
+        w.flag(self.dependent_slices); // dependent_slice_segments_enabled
         w.flag(false); // output_flag_present
         w.u(3, 0); // num_extra_slice_header_bits
         w.flag(false); // sign_data_hiding
@@ -408,6 +411,9 @@ mod tests {
             color: ColorTags::default(),
             cu_qp_delta: true,
             sao: false,
+            dependent_slices: true,
+            transform_depth_inter: 4,
+            transform_depth_intra: 4,
         };
         assert_eq!(c(3456, 544, 240).level_idc(), 153);
         assert_eq!(c(1920, 272, 240).level_idc(), 123);

@@ -156,6 +156,32 @@ fn pick_hevc_entrypoint(eps: &[c_int]) -> Option<VAEntrypoint> {
     .find(|&ep| eps.contains(&(ep as c_int)))
 }
 
+/// Keep packed parameter sets and VA parameters within the same driver limits.
+/// Older drivers can omit these optional attributes; retain the existing choices then.
+fn apply_hevc_caps(seq: &mut SeqConfig, features: u32, block_sizes: u32) {
+    if features != VA_ATTRIB_NOT_SUPPORTED {
+        let features = VAConfigAttribValEncHEVCFeatures { value: features };
+        // SAFETY: Both union views contain only integer bitfields over the same u32.
+        let f = unsafe { features.bits };
+        seq.dependent_slices = f.dependent_slices() != 0;
+        seq.cu_qp_delta = f.cu_qp_delta() == VA_FEATURE_REQUIRED
+            || (f.cu_qp_delta() == VA_FEATURE_SUPPORTED && seq.cu_qp_delta);
+    }
+    if block_sizes != VA_ATTRIB_NOT_SUPPORTED {
+        let sizes = VAConfigAttribValEncHEVCBlockSizes { value: block_sizes };
+        // SAFETY: Both union views contain only integer bitfields over the same u32.
+        let b = unsafe { sizes.bits };
+        seq.transform_depth_inter = seq
+            .transform_depth_inter
+            .min(b.max_max_transform_hierarchy_depth_inter())
+            .max(b.min_max_transform_hierarchy_depth_inter());
+        seq.transform_depth_intra = seq
+            .transform_depth_intra
+            .min(b.max_max_transform_hierarchy_depth_intra())
+            .max(b.min_max_transform_hierarchy_depth_intra());
+    }
+}
+
 impl Drop for Display {
     fn drop(&mut self) {
         // SAFETY: `dpy` was initialised in `Display::open` and is terminated only here.
@@ -215,13 +241,16 @@ impl Session {
         let entrypoint = display
             .hevc_entrypoint()
             .context("no VAAPI HEVC encode entrypoint")?;
-        let seq = SeqConfig {
+        let mut seq = SeqConfig {
             width: layout.width,
             height: layout.tile_height,
             pic_rate: cfg.fps * TILE_COUNT as u32,
             color: cfg.color,
             cu_qp_delta: cfg.bitrate_bps.is_some(),
             sao: cfg.sao,
+            dependent_slices: true,
+            transform_depth_inter: 4,
+            transform_depth_intra: 4,
         };
         let rc_mode = if cfg.bitrate_bps.is_some() {
             VA_RC_VBR
@@ -242,20 +271,29 @@ impl Session {
                 type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
                 value: 0,
             },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribEncHEVCFeatures,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribEncHEVCBlockSizes,
+                value: 0,
+            },
         ];
         check(
-            // SAFETY: `dpy` is live, and `attribs` holds the 3 entries the count refers to.
+            // SAFETY: `dpy` is live, and `attribs` holds the 5 entries the count refers to.
             unsafe {
                 va().vaGetConfigAttributes(
                     dpy,
                     VAProfile::VAProfileHEVCMain,
                     entrypoint,
                     attribs.as_mut_ptr(),
-                    3,
+                    attribs.len() as c_int,
                 )
             },
             "vaGetConfigAttributes",
         )?;
+        apply_hevc_caps(&mut seq, attribs[3].value, attribs[4].value);
         let packed = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE;
         if attribs[0].value & VA_RT_FORMAT_YUV420 == 0
             || attribs[1].value & rc_mode == 0
@@ -599,8 +637,8 @@ impl Session {
         f.set_low_delay_seq(1);
         s.log2_diff_max_min_luma_coding_block_size = 3;
         s.log2_diff_max_min_transform_block_size = 3;
-        s.max_transform_hierarchy_depth_inter = 4;
-        s.max_transform_hierarchy_depth_intra = 4;
+        s.max_transform_hierarchy_depth_inter = self.seq.transform_depth_inter as u8;
+        s.max_transform_hierarchy_depth_intra = self.seq.transform_depth_intra as u8;
         s.vui_parameters_present_flag = 1;
         // SAFETY: `vui_fields` is a union whose `bits` view covers the whole value, and the
         // struct was zero-initialised.
@@ -724,7 +762,7 @@ impl Session {
             f.set_idr_pic_flag((kind == PicKind::Idr) as u32);
             f.set_coding_type(if slice_type == SliceType::I { 1 } else { 2 });
             f.set_reference_pic_flag(1);
-            f.set_dependent_slice_segments_enabled_flag(1);
+            f.set_dependent_slice_segments_enabled_flag(self.seq.dependent_slices as u32);
             f.set_transform_skip_enabled_flag(1);
             f.set_cu_qp_delta_enabled_flag(self.seq.cu_qp_delta as u32);
             f.set_pps_loop_filter_across_slices_enabled_flag(1);
@@ -955,6 +993,66 @@ fn finish_detection<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sequence() -> SeqConfig {
+        SeqConfig {
+            width: 2560,
+            height: 368,
+            pic_rate: 240,
+            color: super::super::ColorTags::default(),
+            cu_qp_delta: true,
+            sao: false,
+            dependent_slices: true,
+            transform_depth_inter: 4,
+            transform_depth_intra: 4,
+        }
+    }
+
+    #[test]
+    fn intel_raptor_lake_caps_constrain_parameter_sets() {
+        let mut seq = test_sequence();
+        // libva 2.24 / iHD 26.2.4, HEVC Main EncSlice on Raptor Lake-P.
+        apply_hevc_caps(&mut seq, 0x0190_0464, 0x0000_88c7);
+        assert!(!seq.dependent_slices);
+        assert_eq!(seq.transform_depth_inter, 2);
+        assert_eq!(seq.transform_depth_intra, 2);
+        assert!(seq.cu_qp_delta);
+        // This driver requires CU QP syntax even in constant-QP mode.
+        seq.cu_qp_delta = false;
+        apply_hevc_caps(&mut seq, 0x0190_0464, 0x0000_88c7);
+        assert!(seq.cu_qp_delta);
+    }
+
+    #[test]
+    fn missing_hevc_caps_preserve_legacy_parameters() {
+        let mut seq = test_sequence();
+        apply_hevc_caps(&mut seq, VA_ATTRIB_NOT_SUPPORTED, VA_ATTRIB_NOT_SUPPORTED);
+        assert!(seq.dependent_slices);
+        assert!(seq.cu_qp_delta);
+        assert_eq!(seq.transform_depth_inter, 4);
+        assert_eq!(seq.transform_depth_intra, 4);
+    }
+
+    #[test]
+    fn optional_features_and_transform_depth_minima_are_respected() {
+        let mut seq = test_sequence();
+        seq.cu_qp_delta = false;
+        seq.transform_depth_inter = 0;
+        seq.transform_depth_intra = 0;
+        // Dependent slices and CU QP deltas are optional; depth range is 1-2.
+        apply_hevc_caps(
+            &mut seq,
+            (1 << 14) | (1 << 22),
+            (2 << 10) | (1 << 12) | (2 << 14) | (1 << 16),
+        );
+        assert!(seq.dependent_slices);
+        assert!(!seq.cu_qp_delta);
+        assert_eq!(seq.transform_depth_inter, 1);
+        assert_eq!(seq.transform_depth_intra, 1);
+        apply_hevc_caps(&mut seq, 0, VA_ATTRIB_NOT_SUPPORTED);
+        assert!(!seq.dependent_slices);
+        assert!(!seq.cu_qp_delta);
+    }
 
     #[test]
     fn failed_fused_import_releases_slot_for_vpp() {

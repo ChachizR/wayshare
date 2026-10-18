@@ -10,11 +10,6 @@ use khronos_egl as egl;
 const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
 const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
 const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
-const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
-const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 const EGL_CONTEXT_OPENGL_PROFILE_MASK: egl::Int = 0x30fd;
 const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: egl::Int = 1;
 
@@ -31,9 +26,25 @@ pub struct PlaneDesc {
     pub modifier: u64,
 }
 
-/// EGL attributes for importing one dmabuf plane. An INVALID modifier means the
-/// layout is implicit, so the modifier attributes are left out.
-fn dmabuf_attribs(p: &PlaneDesc) -> Vec<egl::Attrib> {
+/// EGL plane attribute keys are contiguous for planes 0-2, but plane 3 was added
+/// by EGL_EXT_image_dma_buf_import_modifiers in a separate range.
+const PLANE_ATTRIBS: [[egl::Attrib; 5]; 4] = [
+    [0x3272, 0x3273, 0x3274, 0x3443, 0x3444],
+    [0x3275, 0x3276, 0x3277, 0x3445, 0x3446],
+    [0x3278, 0x3279, 0x327a, 0x3447, 0x3448],
+    [0x3440, 0x3441, 0x3442, 0x3449, 0x344a],
+];
+
+/// Import all memory planes, including auxiliary compression planes. INVALID
+/// means implicit layout, so no plane receives explicit modifier attributes.
+fn dmabuf_attribs(planes: &[PlaneDesc]) -> Result<Vec<egl::Attrib>> {
+    if planes.is_empty() || planes.len() > PLANE_ATTRIBS.len() {
+        bail!(
+            "EGL dmabuf import requires 1-4 planes; got {}",
+            planes.len()
+        );
+    }
+    let p = &planes[0];
     let mut attribs = vec![
         egl::WIDTH as egl::Attrib,
         p.width as egl::Attrib,
@@ -41,23 +52,27 @@ fn dmabuf_attribs(p: &PlaneDesc) -> Vec<egl::Attrib> {
         p.height as egl::Attrib,
         EGL_LINUX_DRM_FOURCC_EXT,
         p.fourcc as egl::Attrib,
-        EGL_DMA_BUF_PLANE0_FD_EXT,
-        p.fd as egl::Attrib,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-        p.offset as egl::Attrib,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT,
-        p.pitch as egl::Attrib,
     ];
-    if p.modifier != super::alloc::MOD_INVALID {
+    for (p, keys) in planes.iter().zip(PLANE_ATTRIBS) {
         attribs.extend([
-            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-            (p.modifier & 0xffff_ffff) as egl::Attrib,
-            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-            (p.modifier >> 32) as egl::Attrib,
+            keys[0],
+            p.fd as egl::Attrib,
+            keys[1],
+            p.offset as egl::Attrib,
+            keys[2],
+            p.pitch as egl::Attrib,
         ]);
+        if p.modifier != super::alloc::MOD_INVALID {
+            attribs.extend([
+                keys[3],
+                (p.modifier & 0xffff_ffff) as egl::Attrib,
+                keys[4],
+                (p.modifier >> 32) as egl::Attrib,
+            ]);
+        }
     }
     attribs.push(egl::ATTRIB_NONE);
-    attribs
+    Ok(attribs)
 }
 
 pub struct Gl {
@@ -164,7 +179,13 @@ impl Gl {
 
     /// Wraps one dmabuf plane as a 2D texture (current context required).
     pub fn import(&self, p: &PlaneDesc) -> Result<(egl::Image, glow::Texture)> {
-        let attribs = dmabuf_attribs(p);
+        self.import_planes(std::slice::from_ref(p))
+    }
+
+    /// Wraps a complete dmabuf, including compression planes, as a texture.
+    /// The context must be current and all plane fds must remain open during import.
+    pub fn import_planes(&self, planes: &[PlaneDesc]) -> Result<(egl::Image, glow::Texture)> {
+        let attribs = dmabuf_attribs(planes)?;
         let image = self
             .egl
             .create_image(
@@ -236,14 +257,75 @@ mod tests {
     }
 
     fn has_modifier(attribs: &[egl::Attrib]) -> bool {
-        attribs.iter().step_by(2).any(|&a| {
-            a == EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT || a == EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT
-        })
+        attribs
+            .iter()
+            .step_by(2)
+            .any(|&a| a == PLANE_ATTRIBS[0][3] || a == PLANE_ATTRIBS[0][4])
+    }
+
+    #[test]
+    fn compressed_rgb_import_includes_all_memory_planes() {
+        let modifier = 0x0100_0000_0000_0008;
+        let mut planes = [plane(modifier), plane(modifier), plane(modifier)];
+        for (i, p) in planes.iter_mut().enumerate() {
+            p.fd = 10 + i as i32;
+            p.offset = [0, 14745600, 14807040][i];
+            p.pitch = [10240, 1280, 64][i];
+        }
+        let attrs = dmabuf_attribs(&planes).unwrap();
+        let value = |key| {
+            attrs
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .find(|p| p[0] == key)
+                .unwrap()[1]
+        };
+        for (p, keys) in planes.iter().zip(PLANE_ATTRIBS) {
+            assert_eq!(value(keys[0]), p.fd as egl::Attrib);
+            assert_eq!(value(keys[1]), p.offset as egl::Attrib);
+            assert_eq!(value(keys[2]), p.pitch as egl::Attrib);
+            assert_eq!(value(keys[3]), 8);
+            assert_eq!(value(keys[4]), 0x0100_0000);
+        }
+        assert_eq!(attrs.last(), Some(&egl::ATTRIB_NONE));
+    }
+
+    #[test]
+    fn fourth_plane_uses_extension_attribute_range() {
+        let planes = [
+            plane(MOD_LINEAR),
+            plane(MOD_LINEAR),
+            plane(MOD_LINEAR),
+            plane(MOD_LINEAR),
+        ];
+        let attrs = dmabuf_attribs(&planes).unwrap();
+        for key in [0x3440, 0x3441, 0x3442, 0x3449, 0x344a] {
+            assert!(attrs.as_chunks::<2>().0.iter().any(|pair| pair[0] == key));
+        }
+        let implicit = [plane(MOD_INVALID), plane(MOD_INVALID)];
+        let attrs = dmabuf_attribs(&implicit).unwrap();
+        for keys in PLANE_ATTRIBS {
+            assert!(
+                !attrs
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|p| p[0] == keys[3] || p[0] == keys[4])
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_plane_counts_are_rejected() {
+        assert!(dmabuf_attribs(&[]).is_err());
+        let planes: Vec<_> = (0..5).map(|_| plane(MOD_LINEAR)).collect();
+        assert!(dmabuf_attribs(&planes).is_err());
     }
 
     #[test]
     fn invalid_modifier_imports_implicitly() {
-        let attribs = dmabuf_attribs(&plane(MOD_INVALID));
+        let attribs = dmabuf_attribs(&[plane(MOD_INVALID)]).unwrap();
         assert!(!has_modifier(&attribs));
         assert_eq!(attribs.last(), Some(&egl::ATTRIB_NONE));
     }
@@ -252,14 +334,14 @@ mod tests {
     fn explicit_modifier_is_passed_through() {
         let tiled = 0x0200_0000_1234_5678;
         for modifier in [MOD_LINEAR, tiled] {
-            let attribs = dmabuf_attribs(&plane(modifier));
+            let attribs = dmabuf_attribs(&[plane(modifier)]).unwrap();
             let lo = attribs
                 .iter()
-                .position(|&a| a == EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT)
+                .position(|&a| a == PLANE_ATTRIBS[0][3])
                 .unwrap();
             let hi = attribs
                 .iter()
-                .position(|&a| a == EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT)
+                .position(|&a| a == PLANE_ATTRIBS[0][4])
                 .unwrap();
             assert_eq!(attribs[lo + 1], (modifier & 0xffff_ffff) as egl::Attrib);
             assert_eq!(attribs[hi + 1], (modifier >> 32) as egl::Attrib);

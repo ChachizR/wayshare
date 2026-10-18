@@ -315,19 +315,20 @@ impl TileDiffer {
         if let Some((_, (_, t))) = self.imports.iter().find(|(id, _)| *id == buf.id) {
             return Ok(*t);
         }
-        if buf.planes.len() != 1 {
-            bail!("diff supports single-plane buffers only");
-        }
-        let p = &buf.planes[0];
-        let imported = self.gl.import(&PlaneDesc {
-            fd: p.fd.as_raw_fd(),
-            fourcc: buf.fourcc,
-            width: buf.width,
-            height: buf.height,
-            offset: p.offset,
-            pitch: p.stride,
-            modifier: buf.modifier,
-        })?;
+        let planes: Vec<_> = buf
+            .planes
+            .iter()
+            .map(|p| PlaneDesc {
+                fd: p.fd.as_raw_fd(),
+                fourcc: buf.fourcc,
+                width: buf.width,
+                height: buf.height,
+                offset: p.offset,
+                pitch: p.stride,
+                modifier: buf.modifier,
+            })
+            .collect();
+        let imported = self.gl.import_planes(&planes)?;
         if self.imports.len() >= MAX_IMPORTS {
             let (_, old) = self.imports.remove(0);
             self.gl.forget(old);
